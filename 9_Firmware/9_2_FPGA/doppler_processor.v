@@ -130,6 +130,32 @@ wire frame_start_pulse = new_chirp_frame & ~new_chirp_frame_d1;
 reg [5:0] fft_sample_counter;
 reg [9:0] processing_timeout;
 
+// Memory write enable and data signals (extracted for BRAM inference)
+reg mem_we;
+reg [10:0] mem_waddr_r;
+reg [DATA_WIDTH-1:0] mem_wdata_i, mem_wdata_q;
+
+// Memory read data (registered for BRAM read latency)
+reg [DATA_WIDTH-1:0] mem_rdata_i, mem_rdata_q;
+
+// ----------------------------------------------------------
+// Separate always block for memory writes — NO async reset
+// in sensitivity list, so Vivado can infer Block RAM.
+// ----------------------------------------------------------
+always @(posedge clk) begin
+    if (mem_we) begin
+        doppler_i_mem[mem_waddr_r] <= mem_wdata_i;
+        doppler_q_mem[mem_waddr_r] <= mem_wdata_q;
+    end
+    // Registered read — address driven by mem_read_addr from FSM
+    mem_rdata_i <= doppler_i_mem[mem_read_addr];
+    mem_rdata_q <= doppler_q_mem[mem_read_addr];
+end
+
+// ----------------------------------------------------------
+// Main FSM — async reset for control registers only.
+// Memory arrays are NOT touched here.
+// ----------------------------------------------------------
 always @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
         state <= S_IDLE;
@@ -147,10 +173,21 @@ always @(posedge clk or negedge reset_n) begin
         status <= 0;
         chirps_received <= 0;
         chirp_state <= 0;
+        mem_we <= 0;
+        mem_waddr_r <= 0;
+        mem_wdata_i <= 0;
+        mem_wdata_q <= 0;
+        mult_i <= 0;
+        mult_q <= 0;
+        fft_input_i <= 0;
+        fft_input_q <= 0;
+        doppler_output <= 0;
+        doppler_bin <= 0;
     end else begin
         doppler_valid <= 0;
         fft_input_valid <= 0;
         fft_input_last <= 0;
+        mem_we <= 0;
         
         if (processing_timeout > 0) begin
             processing_timeout <= processing_timeout - 1;
@@ -164,24 +201,21 @@ always @(posedge clk or negedge reset_n) begin
                     write_range_bin <= 0;
                     frame_buffer_full <= 0;
                     chirps_received <= 0;
-                    //chirp_state <= 1;  // Start accumulating
                 end
                 
                 if (data_valid && !frame_buffer_full) begin
                     state <= S_ACCUMULATE;
-						  write_range_bin <= 0;
+                    write_range_bin <= 0;
                 end
             end
             
             S_ACCUMULATE: begin
                 if (data_valid) begin
-                    // Store with proper addressing
-                    doppler_i_mem[mem_write_addr] <= range_data[15:0];
-                    doppler_q_mem[mem_write_addr] <= range_data[31:16];
-                    
-                    // Debug output to see what's being written
-                    // $display("Time=%t: Write addr=%d (chirp=%d, range=%d), Data=%h",
-                    //          $time, mem_write_addr, write_chirp_index, write_range_bin, range_data);
+                    // Drive memory write signals (actual write in separate block)
+                    mem_we      <= 1;
+                    mem_waddr_r <= mem_write_addr;
+                    mem_wdata_i <= range_data[15:0];
+                    mem_wdata_q <= range_data[31:16];
                     
                     // Increment range bin
                     if (write_range_bin < RANGE_BINS - 1) begin
@@ -195,8 +229,7 @@ always @(posedge clk or negedge reset_n) begin
                         // Check if frame is complete
                         if (write_chirp_index >= CHIRPS_PER_FRAME - 1) begin
                             frame_buffer_full <= 1;
-                            chirp_state <= 0;  // Stop accumulating
-                            // Could automatically start processing here:
+                            chirp_state <= 0;
                             state <= S_LOAD_FFT;
                             read_range_bin <= 0;
                             read_doppler_index <= 0;
@@ -207,23 +240,21 @@ always @(posedge clk or negedge reset_n) begin
                 end 
             end
             
-            // [Rest of S_LOAD_FFT, S_FFT_WAIT, S_OUTPUT states remain similar]
-            // But with fixed addressing in S_LOAD_FFT:
             S_LOAD_FFT: begin
                 fft_start <= 0;
                 
                 if (fft_sample_counter < DOPPLER_FFT_SIZE) begin
-                    // Use correct addressing for reading
-                    mult_i <= $signed(doppler_i_mem[mem_read_addr]) * 
+                    // Use registered read data (one cycle latency from BRAM)
+                    mult_i <= $signed(mem_rdata_i) *
                                    $signed(window_coeff[read_doppler_index]);
-                    mult_q <= $signed(doppler_q_mem[mem_read_addr]) * 
+                    mult_q <= $signed(mem_rdata_q) *
                                    $signed(window_coeff[read_doppler_index]);
                     
-						          // Round instead of truncate
-						  fft_input_i <= (mult_i + (1 << 14)) >>> 15;  // Round to nearest
-						  fft_input_q <= (mult_q + (1 << 14)) >>> 15;
+                    // Round instead of truncate
+                    fft_input_i <= (mult_i + (1 << 14)) >>> 15;
+                    fft_input_q <= (mult_q + (1 << 14)) >>> 15;
                     
-						  fft_input_valid <= 1;
+                    fft_input_valid <= 1;
                     
                     if (fft_sample_counter == DOPPLER_FFT_SIZE - 1) begin
                         fft_input_last <= 1;

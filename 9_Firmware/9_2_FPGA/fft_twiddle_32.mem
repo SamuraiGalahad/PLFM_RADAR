@@ -1,0 +1,11 @@
+// Quarter-wave cosine ROM for 32-point FFT
+// 8 entries, 16-bit signed Q15 ($readmemh format)
+// cos(2*pi*k/32) for k = 0..7
+7FFF
+7D89
+7641
+6A6D
+5A82
+471C
+30FB
+18F9
