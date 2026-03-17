@@ -521,7 +521,9 @@ xpm_memory_tdpram #(
 reg out_pipe_valid;
 reg out_pipe_inverse;
 
-always @(posedge clk or negedge reset_n) begin
+// Sync reset: pure internal pipeline — no functional need for async reset.
+// Enables downstream register absorption.
+always @(posedge clk) begin
     if (!reset_n) begin
         out_pipe_valid   <= 1'b0;
         out_pipe_inverse <= 1'b0;
@@ -532,7 +534,10 @@ always @(posedge clk or negedge reset_n) begin
 end
 
 // ============================================================================
-// MAIN FSM
+// MAIN FSM — Block 1: Control / FSM / Output Interface (async reset)
+// ============================================================================
+// Retains async reset for deterministic startup of FSM state and external
+// output interface signals (dout_re/im, dout_valid, done).
 // ============================================================================
 always @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -547,20 +552,6 @@ always @(posedge clk or negedge reset_n) begin
         dout_im        <= 0;
         dout_valid     <= 0;
         done           <= 0;
-        rd_tw_cos      <= 0;
-        rd_tw_sin      <= 0;
-        rd_addr_even   <= 0;
-        rd_addr_odd    <= 0;
-        rd_inverse     <= 0;
-        rd_tw_idx      <= 0;
-        rd_a_re        <= 0;
-        rd_a_im        <= 0;
-        rd_b_re        <= 0;
-        rd_b_im        <= 0;
-        bf_t_re        <= 0;
-        bf_t_im        <= 0;
-        bf_prod_re     <= 0;
-        bf_prod_im     <= 0;
     end else begin
         dout_valid <= 1'b0;
         done       <= 1'b0;
@@ -589,58 +580,22 @@ always @(posedge clk or negedge reset_n) begin
         end
 
         ST_BF_READ: begin
-            // Register butterfly addresses and twiddle index.
-            // BRAM read initiated by bram_port_mux (addresses presented
-            // combinationally); data arrives next cycle (ST_BF_TW).
-            // Twiddle ROM lookup uses rd_tw_idx next cycle, breaking the
-            // address-calc → ROM → quarter-wave-mux combinational path.
-            rd_addr_even <= bf_addr_even;
-            rd_addr_odd  <= bf_addr_odd;
-            rd_inverse   <= inverse;
-            rd_tw_idx    <= bf_tw_idx;
-            state        <= ST_BF_TW;
+            state <= ST_BF_TW;
         end
 
         ST_BF_TW: begin
-            // BRAM data valid this cycle (1-cycle read latency).
-            // Capture BRAM data into pipeline regs.
-            // Twiddle ROM lookup is combinational from registered rd_tw_idx
-            // — capture the result into rd_tw_cos/sin.
-            rd_a_re   <= mem_rdata_a_re;
-            rd_a_im   <= mem_rdata_a_im;
-            rd_b_re   <= mem_rdata_b_re;
-            rd_b_im   <= mem_rdata_b_im;
-            rd_tw_cos <= tw_cos_lookup;
-            rd_tw_sin <= tw_sin_lookup;
-            state     <= ST_BF_MULT2;
+            state <= ST_BF_MULT2;
         end
 
         ST_BF_MULT2: begin
-            // Compute raw twiddle products from registered BRAM data.
-            // Path: register → DSP48E1 multiply-accumulate → register (bf_prod_re/im)
-            // The shift is deferred to the next cycle to break the DSP→CARRY4 path.
-            if (!rd_inverse) begin
-                bf_prod_re <= rd_b_re * rd_tw_cos + rd_b_im * rd_tw_sin;
-                bf_prod_im <= rd_b_im * rd_tw_cos - rd_b_re * rd_tw_sin;
-            end else begin
-                bf_prod_re <= rd_b_re * rd_tw_cos - rd_b_im * rd_tw_sin;
-                bf_prod_im <= rd_b_im * rd_tw_cos + rd_b_re * rd_tw_sin;
-            end
             state <= ST_BF_SHIFT;
         end
 
         ST_BF_SHIFT: begin
-            // Apply arithmetic right shift to registered DSP products.
-            // This is now register → bit-select/sign-extend → register,
-            // which should be near-zero logic (pure wiring + sign extension).
-            bf_t_re <= bf_prod_re >>> (TWIDDLE_W - 1);
-            bf_t_im <= bf_prod_im >>> (TWIDDLE_W - 1);
             state <= ST_BF_WRITE;
         end
 
         ST_BF_WRITE: begin
-            // bf_sum/bf_dif are combinational from registered rd_a and bf_t.
-            // BRAM write data driven by bram_port_mux using bf_sum/bf_dif.
             if (bfly_count == FFT_N_HALF_M1[LOG2N-1:0]) begin
                 bfly_count <= 0;
                 if (stage == LOG2N - 1) begin
@@ -685,6 +640,94 @@ always @(posedge clk or negedge reset_n) begin
         end
 
         default: state <= ST_IDLE;
+        endcase
+    end
+end
+
+// ============================================================================
+// MAIN FSM — Block 2: DSP/BRAM Datapath Pipeline (sync reset)
+// ============================================================================
+// Sync reset enables Vivado to absorb these registers into hard blocks:
+//   - rd_b_re/im     → DSP48E1 AREG (butterfly multiply A-port input)
+//   - rd_tw_cos/sin  → DSP48E1 BREG (butterfly multiply B-port input)
+//   - bf_prod_re/im  → DSP48E1 PREG (multiply output register)
+//   - rd_a_re/im     → BRAM output register (REGCE)
+//   - rd_tw_idx      → DSP48E1 PREG (twiddle index multiply output)
+//   - bf_t_re/im, rd_addr_even/odd, rd_inverse — internal pipeline
+//
+// These registers are only meaningful during COMPUTE states (BF_READ through
+// BF_WRITE). Their values are always overwritten before use after every FSM
+// transition, so sync reset is functionally equivalent to async reset.
+// ============================================================================
+always @(posedge clk) begin
+    if (!reset_n) begin
+        rd_tw_cos      <= 0;
+        rd_tw_sin      <= 0;
+        rd_addr_even   <= 0;
+        rd_addr_odd    <= 0;
+        rd_inverse     <= 0;
+        rd_tw_idx      <= 0;
+        rd_a_re        <= 0;
+        rd_a_im        <= 0;
+        rd_b_re        <= 0;
+        rd_b_im        <= 0;
+        bf_t_re        <= 0;
+        bf_t_im        <= 0;
+        bf_prod_re     <= 0;
+        bf_prod_im     <= 0;
+    end else begin
+        case (state)
+
+        ST_BF_READ: begin
+            // Register butterfly addresses and twiddle index.
+            // BRAM read initiated by bram_port_mux (addresses presented
+            // combinationally); data arrives next cycle (ST_BF_TW).
+            // Twiddle ROM lookup uses rd_tw_idx next cycle, breaking the
+            // address-calc -> ROM -> quarter-wave-mux combinational path.
+            rd_addr_even <= bf_addr_even;
+            rd_addr_odd  <= bf_addr_odd;
+            rd_inverse   <= inverse;
+            rd_tw_idx    <= bf_tw_idx;
+        end
+
+        ST_BF_TW: begin
+            // BRAM data valid this cycle (1-cycle read latency).
+            // Capture BRAM data into pipeline regs.
+            // Twiddle ROM lookup is combinational from registered rd_tw_idx
+            // -- capture the result into rd_tw_cos/sin.
+            rd_a_re   <= mem_rdata_a_re;
+            rd_a_im   <= mem_rdata_a_im;
+            rd_b_re   <= mem_rdata_b_re;
+            rd_b_im   <= mem_rdata_b_im;
+            rd_tw_cos <= tw_cos_lookup;
+            rd_tw_sin <= tw_sin_lookup;
+        end
+
+        ST_BF_MULT2: begin
+            // Compute raw twiddle products from registered BRAM data.
+            // Path: register -> DSP48E1 multiply-accumulate -> register
+            // The shift is deferred to the next cycle to break the
+            // DSP -> CARRY4 path.
+            if (!rd_inverse) begin
+                bf_prod_re <= rd_b_re * rd_tw_cos + rd_b_im * rd_tw_sin;
+                bf_prod_im <= rd_b_im * rd_tw_cos - rd_b_re * rd_tw_sin;
+            end else begin
+                bf_prod_re <= rd_b_re * rd_tw_cos - rd_b_im * rd_tw_sin;
+                bf_prod_im <= rd_b_im * rd_tw_cos + rd_b_re * rd_tw_sin;
+            end
+        end
+
+        ST_BF_SHIFT: begin
+            // Apply arithmetic right shift to registered DSP products.
+            // Register -> bit-select/sign-extend -> register
+            // (near-zero logic: pure wiring + sign extension).
+            bf_t_re <= bf_prod_re >>> (TWIDDLE_W - 1);
+            bf_t_im <= bf_prod_im >>> (TWIDDLE_W - 1);
+        end
+
+        default: begin
+            // No datapath update in other states — registers hold values
+        end
         endcase
     end
 end
