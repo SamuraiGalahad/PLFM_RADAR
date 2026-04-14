@@ -885,8 +885,22 @@ void handleSystemError(SystemError_t error) {
         HAL_Delay(200);
     }
 
-    // Critical errors trigger emergency shutdown
-    if (error >= ERROR_RF_PA_OVERCURRENT && error <= ERROR_POWER_SUPPLY) {
+    // Critical errors trigger emergency shutdown.
+    //
+    // Safety-critical range: any fault that can damage the PAs or leave the
+    // system in an undefined state must cut the RF rails via Emergency_Stop().
+    // This covers:
+    //   ERROR_RF_PA_OVERCURRENT .. ERROR_POWER_SUPPLY (9..13) -- PA/supply faults
+    //   ERROR_TEMPERATURE_HIGH  (14) -- >75 C on the PA thermal sensors;
+    //                                  without cutting bias + 5V/5V5/RFPA rails
+    //                                  the GaN QPA2962 stage can thermal-runaway.
+    //   ERROR_WATCHDOG_TIMEOUT  (16) -- health-check loop has stalled (>60 s);
+    //                                  transmitter state is unknown, safest to
+    //                                  latch Emergency_Stop rather than rely on
+    //                                  IWDG reset (which re-energises the rails).
+    if ((error >= ERROR_RF_PA_OVERCURRENT && error <= ERROR_POWER_SUPPLY) ||
+        error == ERROR_TEMPERATURE_HIGH ||
+        error == ERROR_WATCHDOG_TIMEOUT) {
         DIAG_ERR("SYS", "CRITICAL ERROR (code %d: %s) -- initiating Emergency_Stop()", error, error_strings[error]);
         snprintf(error_msg, sizeof(error_msg),
                  "CRITICAL ERROR! Initiating emergency shutdown.\r\n");
