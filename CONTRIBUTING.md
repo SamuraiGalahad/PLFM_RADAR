@@ -78,9 +78,9 @@ Every test binary must exit 0.
 
 ```bash
 cd 9_Firmware/9_3_GUI
-python3 -m pytest test_radar_dashboard.py -v
+python3 -m pytest test_GUI_V65_Tk.py -v
 # or without pytest:
-python3 -m unittest test_radar_dashboard -v
+python3 -m unittest test_GUI_V65_Tk -v
 ```
 
 57+ protocol and rendering tests. The `test_record_and_stop` test
@@ -130,7 +130,7 @@ Before pushing, confirm:
 
 1. `bash run_regression.sh` — all phases pass
 2. `make all` (MCU tests) — 20/20 pass
-3. `python3 -m unittest test_radar_dashboard -v` — all pass
+3. `python3 -m unittest test_GUI_V65_Tk -v` — all pass
 4. `python3 validate_mem_files.py` — all checks pass
 5. `python3 compare.py dc && python3 compare_doppler.py stationary && python3 compare_mf.py all`
 6. `git diff --check` — no whitespace issues

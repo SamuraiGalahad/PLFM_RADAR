@@ -3,8 +3,8 @@
 Tests for AERIS-10 Radar Dashboard protocol parsing, command building,
 data recording, and acquisition logic.
 
-Run: python -m pytest test_radar_dashboard.py -v
-  or: python test_radar_dashboard.py
+Run: python -m pytest test_GUI_V65_Tk.py -v
+  or: python test_GUI_V65_Tk.py
 """
 
 import struct
@@ -22,6 +22,7 @@ from radar_protocol import (
     NUM_RANGE_BINS, NUM_DOPPLER_BINS,
     DATA_PACKET_SIZE,
 )
+from GUI_V65_Tk import DemoTarget, DemoSimulator, _ReplayController
 
 
 class TestRadarProtocol(unittest.TestCase):
@@ -717,6 +718,200 @@ class TestAGCVisualizationHistory(unittest.TestCase):
         self.assertAlmostEqual(max(10 * 1.5, 5), 15.0)
         # High saturation
         self.assertAlmostEqual(max(200 * 1.5, 5), 300.0)
+
+
+# =====================================================================
+# Tests for DemoTarget, DemoSimulator, and _ReplayController
+# =====================================================================
+
+
+class TestDemoTarget(unittest.TestCase):
+    """Unit tests for DemoTarget kinematics."""
+
+    def test_initial_values_in_range(self):
+        t = DemoTarget(1)
+        self.assertEqual(t.id, 1)
+        self.assertGreaterEqual(t.range_m, 20)
+        self.assertLessEqual(t.range_m, DemoTarget._MAX_RANGE)
+        self.assertIn(t.classification, ["aircraft", "drone", "bird", "unknown"])
+
+    def test_step_returns_true_in_normal_range(self):
+        t = DemoTarget(2)
+        t.range_m = 150.0
+        t.velocity = 0.0
+        self.assertTrue(t.step())
+
+    def test_step_returns_false_when_out_of_range_high(self):
+        t = DemoTarget(3)
+        t.range_m = DemoTarget._MAX_RANGE + 1
+        t.velocity = -1.0  # moving away
+        self.assertFalse(t.step())
+
+    def test_step_returns_false_when_out_of_range_low(self):
+        t = DemoTarget(4)
+        t.range_m = 2.0
+        t.velocity = 1.0  # moving closer
+        self.assertFalse(t.step())
+
+    def test_velocity_clamped(self):
+        t = DemoTarget(5)
+        t.velocity = 19.0
+        t.range_m = 150.0
+        # Step many times — velocity should stay within [-20, 20]
+        for _ in range(100):
+            t.range_m = 150.0  # keep in range
+            t.step()
+        self.assertGreaterEqual(t.velocity, -20)
+        self.assertLessEqual(t.velocity, 20)
+
+    def test_snr_clamped(self):
+        t = DemoTarget(6)
+        t.snr = 49.5
+        t.range_m = 150.0
+        for _ in range(100):
+            t.range_m = 150.0
+            t.step()
+        self.assertGreaterEqual(t.snr, 0)
+        self.assertLessEqual(t.snr, 50)
+
+
+class TestDemoSimulatorNoTk(unittest.TestCase):
+    """Test DemoSimulator logic without a real Tk event loop.
+
+    We replace ``root.after`` with a mock to avoid needing a display.
+    """
+
+    def _make_simulator(self):
+        from unittest.mock import MagicMock
+
+        fq = queue.Queue(maxsize=100)
+        uq = queue.Queue(maxsize=100)
+        mock_root = MagicMock()
+        # root.after(ms, fn) should return an id (str)
+        mock_root.after.return_value = "mock_after_id"
+        sim = DemoSimulator(fq, uq, mock_root, interval_ms=100)
+        return sim, fq, uq, mock_root
+
+    def test_initial_targets_created(self):
+        sim, _fq, _uq, _root = self._make_simulator()
+        # Should seed 8 initial targets
+        self.assertEqual(len(sim._targets), 8)
+
+    def test_tick_produces_frame_and_targets(self):
+        sim, fq, uq, _root = self._make_simulator()
+        sim._tick()
+        # Should have a frame
+        self.assertFalse(fq.empty())
+        frame = fq.get_nowait()
+        self.assertIsInstance(frame, RadarFrame)
+        self.assertEqual(frame.frame_number, 1)
+        # Should have demo_targets in ui_queue
+        tag, payload = uq.get_nowait()
+        self.assertEqual(tag, "demo_targets")
+        self.assertIsInstance(payload, list)
+
+    def test_tick_produces_nonzero_detections(self):
+        """Demo targets should actually render into the range-Doppler grid."""
+        sim, fq, _uq, _root = self._make_simulator()
+        sim._tick()
+        frame = fq.get_nowait()
+        # At least some targets should produce magnitude > 0 and detections
+        self.assertGreater(frame.magnitude.sum(), 0,
+                           "Demo targets should render into range-Doppler grid")
+        self.assertGreater(frame.detection_count, 0,
+                           "Demo targets should produce detections")
+
+    def test_stop_cancels_after(self):
+        sim, _fq, _uq, mock_root = self._make_simulator()
+        sim._tick()  # sets _after_id
+        sim.stop()
+        mock_root.after_cancel.assert_called_once_with("mock_after_id")
+        self.assertIsNone(sim._after_id)
+
+
+class TestReplayController(unittest.TestCase):
+    """Unit tests for _ReplayController (no GUI required)."""
+
+    def test_initial_state(self):
+        fq = queue.Queue()
+        uq = queue.Queue()
+        ctrl = _ReplayController(fq, uq)
+        self.assertEqual(ctrl.total_frames, 0)
+        self.assertEqual(ctrl.current_index, 0)
+        self.assertFalse(ctrl.is_playing)
+        self.assertIsNone(ctrl.software_fpga)
+
+    def test_set_speed(self):
+        ctrl = _ReplayController(queue.Queue(), queue.Queue())
+        ctrl.set_speed("2x")
+        self.assertAlmostEqual(ctrl._frame_interval, 0.050)
+
+    def test_set_speed_unknown_falls_back(self):
+        ctrl = _ReplayController(queue.Queue(), queue.Queue())
+        ctrl.set_speed("99x")
+        self.assertAlmostEqual(ctrl._frame_interval, 0.100)
+
+    def test_set_loop(self):
+        ctrl = _ReplayController(queue.Queue(), queue.Queue())
+        ctrl.set_loop(True)
+        self.assertTrue(ctrl._loop)
+        ctrl.set_loop(False)
+        self.assertFalse(ctrl._loop)
+
+    def test_seek_increments_past_emitted(self):
+        """After seek(), _current_index should be one past the seeked frame."""
+        fq = queue.Queue(maxsize=100)
+        uq = queue.Queue(maxsize=100)
+        ctrl = _ReplayController(fq, uq)
+        # Manually set engine to a mock to allow seek
+        from unittest.mock import MagicMock
+        mock_engine = MagicMock()
+        mock_engine.total_frames = 10
+        mock_engine.get_frame.return_value = RadarFrame()
+        ctrl._engine = mock_engine
+        ctrl.seek(5)
+        # _current_index should be 6 (past the emitted frame)
+        self.assertEqual(ctrl._current_index, 6)
+        self.assertEqual(ctrl._last_emitted_index, 5)
+        # Frame should be in the queue
+        self.assertFalse(fq.empty())
+
+    def test_seek_clamps_to_bounds(self):
+        from unittest.mock import MagicMock
+
+        fq = queue.Queue(maxsize=100)
+        uq = queue.Queue(maxsize=100)
+        ctrl = _ReplayController(fq, uq)
+        mock_engine = MagicMock()
+        mock_engine.total_frames = 5
+        mock_engine.get_frame.return_value = RadarFrame()
+        ctrl._engine = mock_engine
+
+        ctrl.seek(100)
+        # Should clamp to last frame (index 4), then _current_index = 5
+        self.assertEqual(ctrl._last_emitted_index, 4)
+        self.assertEqual(ctrl._current_index, 5)
+
+        ctrl.seek(-10)
+        # Should clamp to 0, then _current_index = 1
+        self.assertEqual(ctrl._last_emitted_index, 0)
+        self.assertEqual(ctrl._current_index, 1)
+
+    def test_close_releases_engine(self):
+        from unittest.mock import MagicMock
+
+        fq = queue.Queue(maxsize=100)
+        uq = queue.Queue(maxsize=100)
+        ctrl = _ReplayController(fq, uq)
+        mock_engine = MagicMock()
+        mock_engine.total_frames = 5
+        mock_engine.get_frame.return_value = RadarFrame()
+        ctrl._engine = mock_engine
+
+        ctrl.close()
+        mock_engine.close.assert_called_once()
+        self.assertIsNone(ctrl._engine)
+        self.assertIsNone(ctrl.software_fpga)
 
 
 if __name__ == "__main__":
